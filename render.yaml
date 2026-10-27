@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: vco-office-api
+    runtime: docker
+    plan: 0.5c-512mb
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    disk:
+      name: office-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /data
+      - key: OFFICE_NAME
+        value: V&CO OFFICE
+      - key: OFFICE_TIMEZONE
+        value: Asia/Kolkata
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DRIVE_BACKUP_PASSWORD
+        generateValue: true
