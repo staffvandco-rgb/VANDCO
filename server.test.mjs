@@ -1,0 +1,97 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {testServer} from './test-support.mjs';
+
+test('authenticated office workflows and attendance evidence',async t=>{
+    const dir=mkdtempSync(join(tmpdir(),'officehub-test-'));
+    const server=await testServer(t,{dataDir:dir,adminEmail:'admin@example.test',adminPassword:'AdminPassword!123'});
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    t.after(async()=>{await new Promise(resolve=>server.close(resolve));rmSync(dir,{recursive:true,force:true});});
+    const base=`http://127.0.0.1:${server.address().port}`;
+    async function request(path,token,body,method=body?'POST':'GET') {const res=await fetch(base+path,{method,headers:{...(token?{Authorization:`Bearer ${token}`} : {}),'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});return {status:res.status,body:res.headers.get('content-type')?.includes('json')?await res.json():Buffer.from(await res.arrayBuffer())};}
+    const act=(token,op,args={})=>request('/api/action',token,{op,args});
+    assert.equal((await request('/api/state')).status,401);
+    assert.equal((await request('/api/login',null,{email:'admin@example.test',password:'wrong'})).status,401);
+    const admin=(await request('/api/login',null,{email:'admin@example.test',password:'AdminPassword!123'})).body;
+    assert.ok(admin.token);assert.ok(!JSON.stringify(admin.employees).includes('password'));
+    assert.equal((await act(admin.token,'create_employee',{name:'Employee One',email:'one@example.test',department:'Design',title:'Designer',password:'EmployeeOne!123'})).status,200);
+    assert.equal((await act(admin.token,'create_employee',{name:'Employee Two',email:'two@example.test',department:'Operations',title:'Coordinator',password:'EmployeeTwo!123'})).status,200);
+    const one=(await request('/api/login',null,{email:'one@example.test',password:'EmployeeOne!123'})).body;
+    const two=(await request('/api/login',null,{email:'two@example.test',password:'EmployeeTwo!123'})).body;
+    await t.test('role restrictions and private task access',async()=>{
+        assert.equal((await act(one.token,'announce',{title:'Unauthorized',body:'No'})).status,403);
+        assert.equal((await act(one.token,'edit_employee',{id:two.user.id,name:'Changed',email:'changed@example.test',department:'X',title:'X'})).status,403);
+        const state=(await act(admin.token,'assign_task',{owner:one.user.id,title:'Prepare report',instructions:'Check all invoices',photo:Buffer.concat([Buffer.from([255,216]),Buffer.alloc(200,42),Buffer.from([255,217])]).toString('base64'),due:one.today})).body;
+        const task=state.tasks.find(r=>r.owner===one.user.id);
+        assert.equal(task.instructions,'Check all invoices');assert.ok(task.assignmentPhoto);
+        assert.equal((await request('/api/photos/'+task.assignmentPhoto,one.token)).status,200);
+        assert.equal((await request('/api/photos/'+task.assignmentPhoto,admin.token)).status,200);
+        assert.equal((await request('/api/photos/'+task.assignmentPhoto,two.token)).status,403);
+        assert.ok((await request('/api/state',one.token)).body.notifications.some(n=>n.body==='New assignment: Prepare report'));
+        assert.ok(!(await request('/api/state',two.token)).body.notifications.some(n=>n.body==='New assignment: Prepare report'));
+        assert.equal((await act(one.token,'assign_task',{owner:two.user.id,title:'Not permitted',due:one.today})).status,403);
+        assert.equal((await act(two.token,'task_status',{id:task.id,status:'Done'})).status,403);
+                assert.equal((await act(two.token,'submit_task',{id:task.id,text:'Wrong employee'})).status,403);
+        assert.equal((await act(one.token,'submit_task',{id:task.id,text:''})).status,400);
+        assert.equal((await act(one.token,'submit_task',{id:task.id,text:'Invalid',photo:'bad'})).status,400);
+        assert.equal((await act(one.token,'submit_task',{id:task.id,text:'Report drafted'})).status,200);
+        const upload=Buffer.concat([Buffer.from([255,216]),Buffer.alloc(200,42),Buffer.from([255,217])]).toString('base64');
+        const submitted=(await act(one.token,'submit_task',{id:task.id,text:'Photo evidence',photo:upload})).body.tasks.find(r=>r.id===task.id);
+        assert.equal(submitted.submissions.length,2);
+        const photoId=submitted.submissions[1].photo;
+        assert.equal((await request('/api/photos/'+photoId,two.token)).status,403);
+        assert.equal((await request('/api/photos/'+photoId,one.token)).status,200);
+        assert.equal((await request('/api/photos/'+photoId,admin.token)).status,200);
+assert.equal((await act(one.token,'task_status',{id:task.id,status:'Done'})).status,200);
+        assert.equal((await act(one.token,'submit_task',{id:task.id,text:'Too late'})).status,409);
+        assert.equal((await request('/api/state',two.token)).body.tasks.length,0);
+        let after=(await request('/api/state',one.token)).body.tasks;
+        const completed=after.find(r=>r.id===task.id),next=after.find(r=>r.previousTaskId===task.id);
+        assert.ok(next);assert.equal(next.submissions,undefined);assert.equal(next.instructions,task.instructions);assert.equal(next.assignmentPhoto,task.assignmentPhoto);assert.equal(next.title,task.title);assert.equal(next.owner,one.user.id);assert.equal(next.status,'To do');assert.equal(completed.nextTaskId,next.id);
+        await act(one.token,'task_status',{id:task.id,status:'Done'});
+        after=(await request('/api/state',one.token)).body.tasks;assert.equal(after.filter(r=>r.previousTaskId===task.id).length,1);
+        assert.equal((await act(one.token,'task_status',{id:task.id,status:'In progress'})).status,409);
+    });
+    await t.test('leave approvals, overlap validation and notification privacy',async()=>{
+        const pending=(await act(one.token,'request_leave',{start:one.today,end:one.today,reason:'Personal work'})).body.leave[0];
+        assert.equal((await act(one.token,'request_leave',{start:one.today,end:one.today,reason:'Overlap'})).status,409);
+        assert.equal((await act(one.token,'decide_leave',{id:pending.id,status:'Approved'})).status,403);
+        const approved=await act(admin.token,'decide_leave',{id:pending.id,status:'Approved'});assert.equal(approved.status,200);
+        assert.equal((await act(admin.token,'decide_leave',{id:pending.id,status:'Rejected'})).status,409);
+        const notes=(await request('/api/state',one.token)).body.notifications;assert.ok(notes.some(n=>n.body.includes('approved')));
+        assert.equal((await act(two.token,'read_notification',{id:notes[0].id})).status,403);
+    });
+    await t.test('selfie + GPS required on both IN and OUT; server owner and time',async()=>{
+        // Binary fixture exercises transport validation; Android tests capture actual camera frames.
+        const jpeg=Buffer.concat([Buffer.from([255,216]),Buffer.alloc(200,42),Buffer.from([255,217])]).toString('base64');
+        const proof=()=>({photo:jpeg,capturedAt:Date.now(),location:{latitude:12.97,longitude:77.59,accuracy:10,time:Date.now(),provider:'gps',mock:false}});
+        assert.equal((await act(one.token,'punch',{direction:'out',...proof()})).status,409);
+        assert.equal((await act(one.token,'punch',{direction:'in',...proof(),photo:''})).status,400);
+        const stale=proof();stale.location.time-=180000;assert.equal((await act(one.token,'punch',{direction:'in',...stale})).status,400);
+        const mock=proof();mock.location.mock=true;assert.equal((await act(one.token,'punch',{direction:'in',...mock})).status,400);
+        const coarse=proof();coarse.location.accuracy=900;assert.equal((await act(one.token,'punch',{direction:'in',...coarse})).status,400);
+        const before=Date.now();const punch=await act(one.token,'punch',{direction:'in',owner:two.user.id,...proof()});assert.equal(punch.status,200);
+        const row=punch.body.attendance[0];assert.equal(row.owner,one.user.id);assert.ok(Number(row.in)>=before);assert.ok(row.inProof.photo);
+        assert.equal((await act(one.token,'punch',{direction:'in',...proof()})).status,409);
+        assert.equal((await request('/api/photos/'+row.inProof.photo,two.token)).status,403);
+        const image=await request('/api/photos/'+row.inProof.photo,one.token);assert.equal(image.status,200);assert.equal(image.body.toString('base64'),jpeg);
+        assert.equal((await act(one.token,'punch',{direction:'out'})).status,400);
+        const out=await act(one.token,'punch',{direction:'out',...proof()});assert.equal(out.status,200);assert.ok(out.body.attendance[0].outProof.photo);
+        assert.equal((await act(one.token,'punch',{direction:'out',...proof()})).status,409);
+        assert.equal((await act(one.token,'punch',{direction:'in',...proof()})).status,409);
+        assert.equal((await request('/api/state',two.token)).body.attendance.length,0);
+    });
+    await t.test('announcements and password/session revocation',async()=>{
+        assert.equal((await act(admin.token,'announce',{title:'Office update',body:'Team meeting tomorrow.'})).status,200);
+        assert.equal((await request('/api/state',two.token)).body.announcements.length,1);
+        assert.equal((await act(two.token,'change_password',{current:'wrong',password:'NewPassword!123'})).status,403);
+        assert.equal((await act(two.token,'change_password',{current:'EmployeeTwo!123',password:'NewPassword!123'})).status,200);
+        assert.equal((await request('/api/state',two.token)).status,401);
+        assert.equal((await request('/api/login',null,{email:'two@example.test',password:'NewPassword!123'})).status,200);
+        assert.equal((await request('/api/logout',admin.token,{})).status,200);
+        assert.equal((await request('/api/state',admin.token)).status,401);
+    });
+});
